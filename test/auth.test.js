@@ -78,6 +78,17 @@ function verifyOffline(token, clockTimestamp) {
   return jwt.verify(token, rsaKeys.publicKey, { algorithms: ["RS256"], issuer: ISSUER, audience: OFFLINE_AUDIENCE, clockTimestamp });
 }
 
+test("rate limits use the client IP forwarded by the trusted local proxy", async () => {
+  const { app } = fixture(1);
+  const firstIp = "198.51.100.10";
+  const secondIp = "198.51.100.11";
+  const first = () => request(app).post("/api/auth/login").set("X-Forwarded-For", firstIp).send({});
+
+  assert.equal((await first()).status, 400);
+  assert.equal((await first()).status, 429);
+  assert.equal((await request(app).post("/api/auth/login").set("X-Forwarded-For", secondIp).send({})).status, 400);
+});
+
 test("reto firmado cumple issuer/audience/expiración y primer dispositivo recibe tokens ligados", async () => {
   const { app, user, now, challenges } = fixture();
   assert.deepEqual((await request(app).get("/api/health")).body, { ok: true, message: "API Miniventa running" });

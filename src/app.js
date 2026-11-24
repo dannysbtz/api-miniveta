@@ -14,6 +14,7 @@ const { normalizeUsername } = require("./username");
 
 function createApp({ User, Challenge = DeviceChallenge, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
   const app = express();
+  app.set("trust proxy", "loopback");
   const dummyHash = bcrypt.hashSync(crypto.randomBytes(32).toString("hex"), 12);
   const nowSeconds = () => Math.floor(clock() / 1000);
   const active = (user) => user.subscription && user.subscription.status === "active" &&

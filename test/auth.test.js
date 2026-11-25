@@ -272,6 +272,7 @@ test("admin API authenticates operators, manages access and invalidates sessions
   const requestId = crypto.randomUUID();
   const rejectedRequestId = crypto.randomUUID();
   let createdUser;
+  const paymentRecords = [];
   const adminUser = {
     _id: "507f1f77bcf86cd799439011",
     username: "cliente",
@@ -279,7 +280,7 @@ test("admin API authenticates operators, manages access and invalidates sessions
     sessionVersion: 4,
     createdAt: new Date(baseTime),
     updatedAt: new Date(baseTime),
-    subscription: { status: "active", endsAt: new Date(baseTime + 30 * 86400000) },
+    subscription: { status: "active", endsAt: new Date(baseTime + 30 * 86400000), paidAt: null, priceCents: 0 },
     devices: [
       { fingerprint: "a".repeat(64), publicKey: "private-device-key", status: "active", requestId: crypto.randomUUID(), createdAt: new Date(baseTime), updatedAt: new Date(baseTime) },
       { fingerprint: "b".repeat(64), publicKey: "pending-device-key", status: "pending", requestId, createdAt: new Date(baseTime), updatedAt: new Date(baseTime) },
@@ -287,6 +288,7 @@ test("admin API authenticates operators, manages access and invalidates sessions
     ],
   };
   const User = {
+    db: { transaction: async (operation) => operation({}) },
     create: async (document) => {
       createdUser = { ...document, _id: "507f1f77bcf86cd799439012", createdAt: new Date(baseTime), updatedAt: new Date(baseTime) };
       return createdUser;
@@ -297,10 +299,24 @@ test("admin API authenticates operators, manages access and invalidates sessions
       limit() { return this; },
       then(resolve, reject) { return Promise.resolve([adminUser]).then(resolve, reject); },
     }),
+    findById: async (id) => id === adminUser._id ? adminUser : null,
     findOneAndUpdate: async (filter, update) => {
       if (filter._id !== adminUser._id && filter.username !== adminUser.username) return null;
+      if (filter["subscription.endsAt"] && adminUser.subscription.endsAt >= filter["subscription.endsAt"].$lt) return null;
       if (filter.devices && !adminUser.devices.some((device) => device.requestId === filter.devices.$elemMatch.requestId && device.status === "pending")) return null;
-      if (update.$set?.subscription) adminUser.subscription = update.$set.subscription;
+      for (const [path, value] of Object.entries(update.$set || {})) {
+        if (path.startsWith("devices.")) continue;
+        const parts = path.split(".");
+        let target = adminUser;
+        for (const part of parts.slice(0, -1)) target = target[part];
+        target[parts.at(-1)] = value;
+      }
+      for (const [path, value] of Object.entries(update.$push || {})) {
+        const parts = path.split(".");
+        let target = adminUser;
+        for (const part of parts.slice(0, -1)) target = target[part];
+        target[parts.at(-1)].push(value);
+      }
       if (update.$set?.["devices.$[pending].status"]) {
         const activeDevices = adminUser.devices.filter((device) => device.status === "active");
         const target = adminUser.devices.find((device) => device.requestId === filter.devices.$elemMatch.requestId && device.status === "pending");
@@ -316,23 +332,39 @@ test("admin API authenticates operators, manages access and invalidates sessions
       if (update.$inc?.sessionVersion) adminUser.sessionVersion += update.$inc.sessionVersion;
       return adminUser;
     },
+    findOneAndDelete: async (filter) => filter._id === adminUser._id ? adminUser : null,
   };
-  const app = createApp({ User, config: { ...config, adminApiKey } });
+  const Payment = {
+    findOne: async ({ requestId }) => paymentRecords.find((payment) => payment.requestId === requestId) || null,
+    create: async ([record]) => {
+      const payment = { ...record, _id: crypto.randomUUID() };
+      paymentRecords.push(payment);
+      return [payment];
+    },
+    deleteOne: async ({ _id }) => {
+      const index = paymentRecords.findIndex((payment) => payment._id === _id);
+      if (index >= 0) paymentRecords.splice(index, 1);
+    },
+    aggregate: async () => [{
+      summary: [{ totalCents: paymentRecords.reduce((total, payment) => total + payment.amountCents, 0), count: paymentRecords.length }],
+      payments: [...paymentRecords].sort((a, b) => b.paidAt - a.paidAt).slice(0, 500),
+    }],
+  };
+  const app = createApp({ User, Payment, config: { ...config, adminApiKey } });
   const admin = request(app).get("/api/admin/users").set("X-Admin-Key", adminApiKey);
 
   assert.equal((await request(app).get("/api/admin/users")).status, 401);
   const invalidCreate = await request(app).post("/api/admin/users").set("X-Admin-Key", adminApiKey).send({
-    username: "nuevo", name: "Cliente Nuevo", password: "corta", status: "active",
-    endsAt: "2027-01-01T00:00:00.000Z", paidAt: "2026-11-24T00:00:00.000Z",
+    username: "nuevo", name: "Cliente Nuevo", password: "corta", priceCents: 30000,
   });
   assert.equal(invalidCreate.status, 400);
   const created = await request(app).post("/api/admin/users").set("X-Admin-Key", adminApiKey).send({
-    username: " NUEVO ", name: "Cliente Nuevo", password: "una-clave-segura-123", status: "active",
-    endsAt: "2027-01-01T00:00:00.000Z", paidAt: "2026-11-24T00:00:00.000Z",
+    username: " NUEVO ", name: "Cliente Nuevo", password: "una-clave-segura-123", priceCents: 30000,
   });
   assert.equal(created.status, 201);
   assert.equal(created.body.user.username, "nuevo");
-  assert.equal(created.body.user.subscription.paidAt, "2026-11-24T00:00:00.000Z");
+  assert.equal(created.body.user.subscription.status, "inactive");
+  assert.equal(created.body.user.subscription.priceCents, 30000);
   assert.notEqual(createdUser.passwordHash, "una-clave-segura-123");
 
   const listed = await admin;
@@ -342,25 +374,56 @@ test("admin API authenticates operators, manages access and invalidates sessions
   assert.equal(listed.body.users[0].sessionVersion, 4);
   assert.equal((await request(app).get("/api/admin/device-requests").set("X-Admin-Key", adminApiKey)).body.requests.length, 2);
 
+  const priceUpdated = await request(app).patch(`/api/admin/users/${adminUser._id}/access`).set("X-Admin-Key", adminApiKey).send({ priceCents: 32000 });
+  assert.equal(priceUpdated.status, 200);
+  assert.equal(priceUpdated.body.user.subscription.status, "active");
+  assert.equal(priceUpdated.body.user.subscription.priceCents, 32000);
+  assert.equal(adminUser.sessionVersion, 4);
+
   const inactive = await request(app).patch(`/api/admin/users/${adminUser._id}/access`).set("X-Admin-Key", adminApiKey).send({
     status: "inactive",
-    endsAt: "2027-01-01T00:00:00.000Z",
-    paidAt: "2026-11-24T00:00:00.000Z",
+    priceCents: 32000,
   });
   assert.equal(inactive.status, 200);
   assert.equal(inactive.body.user.subscription.status, "inactive");
   assert.equal(adminUser.sessionVersion, 5);
 
+  const paymentBody = {
+    requestId: crypto.randomUUID(),
+    amountCents: 32000,
+    paidAt: "2026-11-24T00:00:00.000Z",
+    endsAt: "2027-01-01T00:00:00.000Z",
+  };
+  const payment = await request(app).post(`/api/admin/users/${adminUser._id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(paymentBody);
+  assert.equal(payment.status, 200);
+  assert.equal(payment.body.user.subscription.status, "active");
+  assert.equal(paymentRecords.length, 1);
+  assert.equal(paymentRecords[0].amountCents, 32000);
+  assert.equal(adminUser.sessionVersion, 6);
+  const retried = await request(app).post(`/api/admin/users/${adminUser._id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(paymentBody);
+  assert.equal(retried.status, 200);
+  assert.equal(paymentRecords.length, 1);
+  assert.equal(adminUser.sessionVersion, 6);
+  const conflict = await request(app).post(`/api/admin/users/${adminUser._id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send({ ...paymentBody, amountCents: 1 });
+  assert.equal(conflict.status, 409);
+
   const approved = await request(app).post(`/api/admin/device-requests/${requestId}/approve`).set("X-Admin-Key", adminApiKey);
   assert.equal(approved.status, 200);
   assert.equal(adminUser.devices[1].status, "active");
   assert.equal(adminUser.devices[0].status, "revoked");
-  assert.equal(adminUser.sessionVersion, 6);
+  assert.equal(adminUser.sessionVersion, 7);
 
   const rejected = await request(app).post(`/api/admin/device-requests/${rejectedRequestId}/reject`).set("X-Admin-Key", adminApiKey);
   assert.equal(rejected.status, 200);
   assert.equal(adminUser.devices[2].status, "revoked");
   const revoked = await request(app).post(`/api/admin/users/${adminUser._id}/revoke-sessions`).set("X-Admin-Key", adminApiKey);
   assert.equal(revoked.status, 200);
-  assert.equal(adminUser.sessionVersion, 7);
+  assert.equal(adminUser.sessionVersion, 8);
+  const deleted = await request(app).delete(`/api/admin/users/${adminUser._id}`).set("X-Admin-Key", adminApiKey);
+  assert.equal(deleted.status, 200);
+  assert.equal(deleted.body.deleted, true);
+  const income = await request(app).get("/api/admin/payments").set("X-Admin-Key", adminApiKey);
+  assert.equal(income.status, 200);
+  assert.equal(income.body.totalCents, 32000);
+  assert.equal(income.body.count, 1);
 });

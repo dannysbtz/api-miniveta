@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const { createApp } = require("./app");
 const { loadConfig } = require("./config");
 const User = require("./user");
+const SubscriptionPayment = require("./subscription-payment");
 
 dotenv.config();
 
@@ -14,6 +15,7 @@ async function startServer() {
     const config = loadConfig();
     await mongoose.connect(process.env.MONGODB_URI);
     await User.init();
+    await SubscriptionPayment.init();
     console.log("MongoDB conectada correctamente");
 
     const app = createApp({ User, config });

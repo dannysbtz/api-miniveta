@@ -20,6 +20,7 @@ const userSchema = new mongoose.Schema({
     status: { type: String, enum: ["active", "inactive"], required: true },
     endsAt: { type: Date, required: true },
     paidAt: { type: Date, default: null },
+    priceCents: { type: Number, required: true, min: 0, default: 0 },
   },
 }, { timestamps: true });
 

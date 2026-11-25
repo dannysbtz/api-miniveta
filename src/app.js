@@ -7,12 +7,13 @@ const { rateLimit } = require("express-rate-limit");
 const { offlineExpiration } = require("./offline-expiry");
 const { ISSUER, SESSION_AUDIENCE, OFFLINE_AUDIENCE, DEVICE_CHALLENGE_AUDIENCE } = require("./config");
 const DeviceChallenge = require("./device-challenge");
+const SubscriptionPayment = require("./subscription-payment");
 const { parseDevicePublicKey, verifyDeviceProof } = require("./device-crypto");
 const { listPendingRequests, approveDeviceRequest, rejectDeviceRequest } = require("./device-requests");
 
 const { normalizeUsername } = require("./username");
 
-function createApp({ User, Challenge = DeviceChallenge, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
+function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPayment, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
   const app = express();
   app.set("trust proxy", "loopback");
   const dummyHash = bcrypt.hashSync(crypto.randomBytes(32).toString("hex"), 12);
@@ -31,6 +32,7 @@ function createApp({ User, Challenge = DeviceChallenge, config, clock = () => Da
     subscription: {
       ...subscriptionInfo(user),
       paidAt: user.subscription.paidAt ? user.subscription.paidAt.toISOString() : null,
+      priceCents: Number.isSafeInteger(user.subscription.priceCents) ? user.subscription.priceCents : 0,
     },
     devices: (user.devices || []).map(({ fingerprint, status, createdAt, updatedAt, requestId }) => ({ fingerprint, status, createdAt, updatedAt, requestId })),
   });
@@ -182,25 +184,21 @@ function createApp({ User, Challenge = DeviceChallenge, config, clock = () => Da
 
   app.post("/api/admin/users", requireAdmin, async (req, res, next) => {
     try {
-      const { username: rawUsername, name: rawName, password, status, endsAt, paidAt } = req.body || {};
+      const { username: rawUsername, name: rawName, password, priceCents } = req.body || {};
       const username = normalizeUsername(rawUsername);
       const name = typeof rawName === "string" ? rawName.trim() : "";
-      const validDate = (value) => typeof value === "string" &&
-        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) && !Number.isNaN(new Date(value).getTime());
       if (!username || !name || name.length > 100 || typeof password !== "string" ||
           Buffer.byteLength(password) < 12 || Buffer.byteLength(password) > 72 || /[\r\n]/.test(password) ||
-          !["active", "inactive"].includes(status) || !validDate(endsAt) || (paidAt !== null && !validDate(paidAt))) {
+          !Number.isSafeInteger(priceCents) || priceCents < 0) {
         return res.status(400).json({ error: "invalid_request" });
       }
-      const parsedEndsAt = new Date(endsAt);
-      if (status === "active" && parsedEndsAt <= new Date(clock())) return res.status(400).json({ error: "invalid_request" });
       const user = await User.create({
         username,
         name,
         passwordHash: await bcrypt.hash(password, 12),
         sessionVersion: 0,
         devices: [],
-        subscription: { status, endsAt: parsedEndsAt, paidAt: paidAt ? new Date(paidAt) : null },
+        subscription: { status: "inactive", endsAt: new Date(clock()), paidAt: null, priceCents },
       });
       return res.status(201).json({ user: adminUserInfo(user) });
     } catch (error) {
@@ -211,24 +209,100 @@ function createApp({ User, Challenge = DeviceChallenge, config, clock = () => Da
 
   app.patch("/api/admin/users/:id/access", requireAdmin, async (req, res, next) => {
     try {
-      const { status, endsAt, paidAt } = req.body || {};
-      if (!/^[a-f\d]{24}$/i.test(req.params.id) || !["active", "inactive"].includes(status) ||
-          typeof endsAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(endsAt) ||
-          (paidAt !== null && (typeof paidAt !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(paidAt)))) {
+      const { status, priceCents } = req.body || {};
+      if (!/^[a-f\d]{24}$/i.test(req.params.id) || (status !== undefined && status !== "inactive") ||
+          (priceCents !== undefined && (!Number.isSafeInteger(priceCents) || priceCents < 0))) {
         return res.status(400).json({ error: "invalid_request" });
       }
-      const parsedEndsAt = new Date(endsAt);
-      const parsedPaidAt = paidAt === null ? null : new Date(paidAt);
-      if (Number.isNaN(parsedEndsAt.getTime()) || (paidAt !== null && Number.isNaN(parsedPaidAt.getTime())) ||
-          (status === "active" && parsedEndsAt <= new Date(clock()))) {
-        return res.status(400).json({ error: "invalid_request" });
-      }
-      const user = await User.findOneAndUpdate({ _id: req.params.id }, {
-        $set: { subscription: { status, endsAt: parsedEndsAt, paidAt: parsedPaidAt } },
-        $inc: { sessionVersion: 1 },
-      }, { new: true, runValidators: true });
+      const set = {};
+      if (status === "inactive") set["subscription.status"] = "inactive";
+      if (priceCents !== undefined) set["subscription.priceCents"] = priceCents;
+      const update = { $set: set };
+      if (status === "inactive") update.$inc = { sessionVersion: 1 };
+      const user = await User.findOneAndUpdate({ _id: req.params.id }, update, { new: true, runValidators: true });
       if (!user) return res.status(404).json({ error: "user_not_found" });
       return res.json({ user: adminUserInfo(user) });
+    } catch (error) { return next(error); }
+  });
+
+  app.post("/api/admin/users/:id/confirm-payment", requireAdmin, async (req, res, next) => {
+    try {
+      const { requestId, amountCents, paidAt, endsAt } = req.body || {};
+      const validDate = (value) => typeof value === "string" &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value) && !Number.isNaN(new Date(value).getTime());
+        if (!/^[a-f\d]{24}$/i.test(req.params.id) || typeof requestId !== "string" ||
+          !/^[a-f\d]{8}-[a-f\d]{4}-4[a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i.test(requestId) ||
+          !Number.isSafeInteger(amountCents) || amountCents < 1 ||
+          !validDate(paidAt) || !validDate(endsAt)) return res.status(400).json({ error: "invalid_request" });
+      const parsedPaidAt = new Date(paidAt);
+      const parsedEndsAt = new Date(endsAt);
+      if (parsedEndsAt <= new Date(clock())) return res.status(400).json({ error: "invalid_request" });
+      const findPreviousPayment = async () => {
+        const payment = await Payment.findOne({ requestId });
+        if (!payment) return null;
+        if (String(payment.userId) !== req.params.id || payment.amountCents !== amountCents ||
+            payment.paidAt.getTime() !== parsedPaidAt.getTime() || payment.endsAt.getTime() !== parsedEndsAt.getTime()) {
+          return { conflict: true };
+        }
+        const user = await User.findById(req.params.id);
+        return user ? { user, payment } : { missing: true };
+      };
+      let result = await findPreviousPayment();
+      if (!result) {
+        try {
+          result = await User.db.transaction(async (session) => {
+            const user = await User.findOneAndUpdate({ _id: req.params.id, "subscription.endsAt": { $lt: parsedEndsAt } }, {
+              $set: { "subscription.status": "active", "subscription.endsAt": parsedEndsAt, "subscription.paidAt": parsedPaidAt },
+              $inc: { sessionVersion: 1 },
+            }, { returnDocument: "after", runValidators: true, session });
+            if (!user) return null;
+            const [payment] = await Payment.create([{
+              requestId,
+              userId: user._id,
+              username: user.username,
+              name: user.name,
+              amountCents,
+              paidAt: parsedPaidAt,
+              endsAt: parsedEndsAt,
+              recordedAt: new Date(clock()),
+            }], { session });
+            return { user, payment };
+          });
+        } catch (error) {
+          if (error.code !== 11000) throw error;
+          result = await findPreviousPayment();
+          if (!result) throw error;
+        }
+      }
+      if (result?.conflict) return res.status(409).json({ error: "payment_request_conflict" });
+      if (!result) {
+        const user = await User.findById(req.params.id);
+        if (user) return res.status(409).json({ error: "renewal_not_extended" });
+      }
+      if (!result || result.missing) return res.status(404).json({ error: "user_not_found" });
+      return res.json({ user: adminUserInfo(result.user), payment: result.payment });
+    } catch (error) { return next(error); }
+  });
+
+  app.get("/api/admin/payments", requireAdmin, async (_req, res, next) => {
+    try {
+      const [result] = await Payment.aggregate([
+        { $facet: {
+          summary: [{ $group: { _id: null, totalCents: { $sum: "$amountCents" }, count: { $sum: 1 } } }],
+          payments: [{ $sort: { paidAt: -1, recordedAt: -1 } }, { $limit: 500 }],
+        } },
+      ]);
+      const summary = result.summary[0] || { totalCents: 0, count: 0 };
+      return res.json({ totalCents: summary.totalCents, count: summary.count, payments: result.payments });
+    } catch (error) { return next(error); }
+  });
+
+  app.delete("/api/admin/users/:id", requireAdmin, async (req, res, next) => {
+    try {
+      if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ error: "invalid_request" });
+      const user = await User.findOneAndDelete({ _id: req.params.id });
+      if (!user) return res.status(404).json({ error: "user_not_found" });
+      return res.json({ deleted: true, userId: String(user._id) });
     } catch (error) { return next(error); }
   });
 

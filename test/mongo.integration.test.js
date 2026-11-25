@@ -10,6 +10,7 @@ const mongoose = require("mongoose");
 const request = require("supertest");
 const { createApp } = require("../src/app");
 const User = require("../src/user");
+const SubscriptionPayment = require("../src/subscription-payment");
 
 test("Mongo persists device requests and CLIs approve/revoke devices and invalidate sessions", { skip: process.env.RUN_MONGO_INTEGRATION !== "1", timeout: 60000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "miniventa-mongo-test-"));
@@ -76,12 +77,76 @@ test("Mongo persists device requests and CLIs approve/revoke devices and invalid
     const newLogin = await loginWithDevice(newPair);
     assert.equal(newLogin.status, 200);
     assert.equal((await authenticatedRequest("get", "/api/auth/access", newLogin.body.sessionToken, newPair)).status, 200);
+    await User.updateOne({ username: "usuario" }, { $set: { "subscription.priceCents": 32000, "subscription.paidAt": new Date("2026-01-01T00:00:00Z") } });
     const updated = runCli("inactive");
     assert.equal(updated.status, 0, updated.stderr);
     const response = await authenticatedRequest("get", "/api/auth/access", newLogin.body.sessionToken, newPair);
     assert.equal(response.status, 401);
     assert.equal((await loginWithDevice(newPair)).status, 403);
     assert.equal(await User.countDocuments({ username: "usuario" }), 1);
+    const finalUser = await User.findOne({ username: "usuario" });
+    assert.equal(finalUser.subscription.priceCents, 32000);
+    assert.equal(finalUser.subscription.paidAt.toISOString(), "2026-01-01T00:00:00.000Z");
+  } finally {
+    await mongoose.disconnect();
+    if (server.exitCode === null && !spawnError) {
+      server.kill("SIGTERM");
+      await new Promise((resolve) => server.once("exit", resolve));
+    }
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Mongo transaction commits and retries payments without losing historical revenue", { skip: process.env.RUN_MONGO_INTEGRATION !== "1", timeout: 60000 }, async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "miniventa-payments-test-"));
+  const listener = net.createServer();
+  await new Promise((resolve) => listener.listen(0, "127.0.0.1", resolve));
+  const port = listener.address().port;
+  await new Promise((resolve) => listener.close(resolve));
+  const uri = `mongodb://127.0.0.1:${port}/miniventa-payments-test?directConnection=true&serverSelectionTimeoutMS=500`;
+  const server = spawn("mongod", ["--dbpath", directory, "--port", String(port), "--bind_ip", "127.0.0.1", "--replSet", "test-rs", "--quiet"], { stdio: "ignore" });
+  let spawnError;
+  server.on("error", (error) => { spawnError = error; });
+  try {
+    let connected = false;
+    for (let attempt = 0; attempt < 30 && !connected; attempt++) {
+      if (spawnError) throw spawnError;
+      try { await mongoose.connect(uri, { autoCreate: false, autoIndex: false }); connected = true; }
+      catch { await new Promise((resolve) => setTimeout(resolve, 200)); }
+    }
+    assert.ok(connected, "MongoDB de prueba no arrancó");
+    await mongoose.connection.db.admin().command({ replSetInitiate: { _id: "test-rs", members: [{ _id: 0, host: `127.0.0.1:${port}` }] } });
+    let writable = false;
+    for (let attempt = 0; attempt < 50 && !writable; attempt++) {
+      try { writable = (await mongoose.connection.db.admin().command({ hello: 1 })).isWritablePrimary; }
+      catch { writable = false; }
+      if (!writable) await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.ok(writable, "El replica set no eligió un primario");
+    await User.createCollection();
+    await SubscriptionPayment.createCollection();
+    await User.createIndexes();
+    await SubscriptionPayment.createIndexes();
+    const user = await User.create({ username: "cliente-pago", name: "Cliente", passwordHash: "hash", subscription: { status: "inactive", endsAt: new Date("2026-01-01T00:00:00Z"), priceCents: 32000 } });
+    const adminApiKey = "a-long-admin-api-key-for-tests-at-least-32-bytes";
+    const config = { adminApiKey };
+    const body = { requestId: crypto.randomUUID(), amountCents: 32000, paidAt: "2026-01-01T00:00:00.000Z", endsAt: "2099-01-01T00:00:00.000Z" };
+    const failingPayment = { findOne: SubscriptionPayment.findOne.bind(SubscriptionPayment), create: async () => { throw new Error("simulated payment failure"); } };
+    const failed = await request(createApp({ User, Payment: failingPayment, config })).post(`/api/admin/users/${user.id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(body);
+    assert.equal(failed.status, 500);
+    assert.equal((await User.findById(user.id)).subscription.status, "inactive");
+    assert.equal(await SubscriptionPayment.countDocuments(), 0);
+    const app = createApp({ User, config });
+    assert.equal((await request(app).post(`/api/admin/users/${user.id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(body)).status, 200);
+    assert.equal((await request(app).post(`/api/admin/users/${user.id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(body)).status, 200);
+    const earlier = { ...body, requestId: crypto.randomUUID(), endsAt: "2098-01-01T00:00:00.000Z" };
+    assert.equal((await request(app).post(`/api/admin/users/${user.id}/confirm-payment`).set("X-Admin-Key", adminApiKey).send(earlier)).status, 409);
+    assert.equal(await SubscriptionPayment.countDocuments(), 1);
+    assert.equal((await User.findById(user.id)).sessionVersion, 1);
+    assert.equal((await request(app).delete(`/api/admin/users/${user.id}`).set("X-Admin-Key", adminApiKey)).status, 200);
+    const income = await request(app).get("/api/admin/payments").set("X-Admin-Key", adminApiKey);
+    assert.equal(income.body.totalCents, 32000);
+    assert.equal(income.body.count, 1);
   } finally {
     await mongoose.disconnect();
     if (server.exitCode === null && !spawnError) {

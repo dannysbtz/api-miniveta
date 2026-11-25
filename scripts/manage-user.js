@@ -75,7 +75,7 @@ async function main() {
   await mongoose.connect(process.env.MONGODB_URI);
   await User.init();
   const user = await User.findOneAndUpdate({ username }, {
-    $set: { username, name, passwordHash, subscription: { status: values.status, endsAt } },
+    $set: { username, name, passwordHash, "subscription.status": values.status, "subscription.endsAt": endsAt },
     $inc: { sessionVersion: 1 },
   }, { upsert: true, new: true, runValidators: true, setDefaultsOnInsert: false });
   console.log(`Usuario ${user._id} guardado; sesiones anteriores invalidadas.`);

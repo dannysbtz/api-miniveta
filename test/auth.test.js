@@ -16,7 +16,7 @@ const baseTime = Date.parse("2026-01-01T00:00:00Z");
 const devicePair = () => crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
 const publicKeyPem = (pair) => pair.publicKey.export({ type: "spki", format: "pem" });
 
-function fixture(loginLimit = 100, challengeLimit = 30) {
+function fixture(loginLimit = 100, challengeLimit = 30, Catalog) {
   let time = baseTime;
   const user = {
     _id: "507f1f77bcf86cd799439011", username: "usuario", name: "Ana", passwordHash, sessionVersion: 1, devices: [],
@@ -53,9 +53,56 @@ function fixture(loginLimit = 100, challengeLimit = 30) {
       return user;
     },
   };
-  const app = createApp({ User, Challenge, config, clock: () => time, loginLimit, challengeLimit });
+  const app = createApp({ User, Challenge, Catalog, config: { ...config, adminApiKey: "a-long-admin-api-key-for-tests-at-least-32-bytes" }, clock: () => time, loginLimit, challengeLimit });
   return { app, user, challenges, advance: (milliseconds) => { time += milliseconds; }, now: () => Math.floor(time / 1000) };
 }
+
+test("catálogo exige clave administrativa o sesión y prueba de dispositivo", async () => {
+  const products = [];
+  let nextId = 1;
+  const duplicate = () => Object.assign(new Error("duplicate"), { code: 11000 });
+  const Catalog = {
+    find: () => ({ sort: async () => [...products] }),
+    create: async (data) => {
+      if (products.some((product) => product.number === data.number)) throw duplicate();
+      const product = { _id: String(nextId++).padStart(24, "0"), ...data };
+      products.push(product);
+      return product;
+    },
+    findByIdAndUpdate: async (id, data) => {
+      if (products.some((product) => product._id !== id && product.number === data.number)) throw duplicate();
+      const product = products.find((entry) => entry._id === id);
+      return product ? Object.assign(product, data) : null;
+    },
+    findByIdAndDelete: async (id) => {
+      const index = products.findIndex((entry) => entry._id === id);
+      return index < 0 ? null : products.splice(index, 1)[0];
+    },
+  };
+  const { app, user } = fixture(100, 30, Catalog);
+  const key = "a-long-admin-api-key-for-tests-at-least-32-bytes";
+  const input = { number: "001", name: "Pan", priceCents: 2000 };
+  assert.equal((await request(app).get("/api/products")).status, 401);
+  assert.equal((await request(app).get("/api/admin/products")).status, 401);
+  assert.equal((await request(app).post("/api/admin/products").set("X-Admin-Key", key).send({ ...input, priceCents: -1 })).status, 400);
+  const created = await request(app).post("/api/admin/products").set("X-Admin-Key", key).send(input);
+  assert.equal(created.status, 201);
+  assert.equal(created.body.product.number, "001");
+  assert.equal((await request(app).post("/api/admin/products").set("X-Admin-Key", key).send(input)).status, 409);
+  const pair = devicePair();
+  const loggedIn = await login(app, pair);
+  const listed = await authenticatedRequest(app, "get", "/api/products", loggedIn.body.sessionToken, pair);
+  assert.equal(listed.status, 200);
+  assert.equal(listed.headers["cache-control"], "no-store");
+  assert.deepEqual(listed.body.products, [created.body.product]);
+  const id = created.body.product.id;
+  const updated = await request(app).put(`/api/admin/products/${id}`).set("X-Admin-Key", key).send({ ...input, priceCents: 3500 });
+  assert.equal(updated.body.product.priceCents, 3500);
+  user.subscription.status = "inactive";
+  assert.equal((await authenticatedRequest(app, "get", "/api/products", loggedIn.body.sessionToken, pair)).status, 403);
+  assert.equal((await request(app).delete(`/api/admin/products/${id}`).set("X-Admin-Key", key)).status, 200);
+  assert.equal((await request(app).delete(`/api/admin/products/${id}`).set("X-Admin-Key", key)).status, 404);
+});
 
 async function login(app, pair = devicePair(), fields = {}) {
   const challengeResponse = await request(app).post("/api/auth/device-challenge").send({});

@@ -8,12 +8,13 @@ const { offlineExpiration } = require("./offline-expiry");
 const { ISSUER, SESSION_AUDIENCE, OFFLINE_AUDIENCE, DEVICE_CHALLENGE_AUDIENCE } = require("./config");
 const DeviceChallenge = require("./device-challenge");
 const SubscriptionPayment = require("./subscription-payment");
+const Product = require("./product");
 const { parseDevicePublicKey, verifyDeviceProof } = require("./device-crypto");
 const { listPendingRequests, approveDeviceRequest, rejectDeviceRequest } = require("./device-requests");
 
 const { normalizeUsername } = require("./username");
 
-function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPayment, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
+function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPayment, Catalog = Product, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
   const app = express();
   app.set("trust proxy", "loopback");
   const dummyHash = bcrypt.hashSync(crypto.randomBytes(32).toString("hex"), 12);
@@ -61,6 +62,10 @@ function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPa
     next();
   });
   app.use("/api/admin", (_req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+  });
+  app.use("/api/products", (_req, res, next) => {
     res.set("Cache-Control", "no-store");
     next();
   });
@@ -158,6 +163,20 @@ function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPa
   app.get("/api/auth/access", requireSession, (req, res) => res.json({ user: userInfo(req.user), subscription: subscriptionInfo(req.user) }));
   app.post("/api/auth/renew", requireSession, (req, res) => res.json({ offlineToken: offlineToken(req.user, req.deviceKey), user: userInfo(req.user), subscription: subscriptionInfo(req.user) }));
 
+  const productInfo = (product) => ({ id: String(product._id), number: product.number, name: product.name, priceCents: product.priceCents });
+  const productInput = (body) => {
+    const number = typeof body?.number === "string" ? body.number.trim() : "";
+    const name = typeof body?.name === "string" ? body.name.trim() : "";
+    const priceCents = body?.priceCents;
+    if (!number || number.length > 40 || !name || name.length > 150 || !Number.isSafeInteger(priceCents) || priceCents < 0) return null;
+    return { number, name, priceCents };
+  };
+  const listProducts = async (_req, res, next) => {
+    try { return res.json({ products: (await Catalog.find({}).sort({ number: 1 })).map(productInfo) }); }
+    catch (error) { return next(error); }
+  };
+  app.get("/api/products", requireSession, listProducts);
+
   function requireAdmin(req, res, next) {
     if (!config.adminApiKey) return res.status(503).json({ error: "admin_not_configured" });
     const supplied = req.get("X-Admin-Key") || "";
@@ -168,6 +187,37 @@ function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPa
     }
     return next();
   }
+
+  app.get("/api/admin/products", requireAdmin, listProducts);
+  app.post("/api/admin/products", requireAdmin, async (req, res, next) => {
+    const data = productInput(req.body);
+    if (!data) return res.status(400).json({ error: "invalid_request" });
+    try { return res.status(201).json({ product: productInfo(await Catalog.create(data)) }); }
+    catch (error) {
+      if (error.code === 11000) return res.status(409).json({ error: "product_number_exists" });
+      return next(error);
+    }
+  });
+  app.put("/api/admin/products/:id", requireAdmin, async (req, res, next) => {
+    const data = productInput(req.body);
+    if (!data || !/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ error: "invalid_request" });
+    try {
+      const product = await Catalog.findByIdAndUpdate(req.params.id, data, { new: true, runValidators: true });
+      if (!product) return res.status(404).json({ error: "product_not_found" });
+      return res.json({ product: productInfo(product) });
+    } catch (error) {
+      if (error.code === 11000) return res.status(409).json({ error: "product_number_exists" });
+      return next(error);
+    }
+  });
+  app.delete("/api/admin/products/:id", requireAdmin, async (req, res, next) => {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ error: "invalid_request" });
+    try {
+      const product = await Catalog.findByIdAndDelete(req.params.id);
+      if (!product) return res.status(404).json({ error: "product_not_found" });
+      return res.json({ deleted: true });
+    } catch (error) { return next(error); }
+  });
 
   app.get("/api/admin/users", requireAdmin, async (req, res, next) => {
     try {

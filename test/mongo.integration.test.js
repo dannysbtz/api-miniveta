@@ -11,6 +11,7 @@ const request = require("supertest");
 const { createApp } = require("../src/app");
 const User = require("../src/user");
 const SubscriptionPayment = require("../src/subscription-payment");
+const ContactRequest = require("../src/contact-request");
 
 test("Mongo persists device requests and CLIs approve/revoke devices and invalidate sessions", { skip: process.env.RUN_MONGO_INTEGRATION !== "1", timeout: 60000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "miniventa-mongo-test-"));
@@ -37,7 +38,17 @@ test("Mongo persists device requests and CLIs approve/revoke devices and invalid
     assert.equal(created.status, 0, created.stderr);
     await assert.rejects(User.create({ username: " USUARIO ", name: "Duplicado", passwordHash: "hash", subscription: { status: "active", endsAt: new Date("2099-01-01T00:00:00Z") } }), { code: 11000 });
     const keys = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
-    const app = createApp({ User, config: { ...keys, sessionSecret: "test-session-secret-with-at-least-32-bytes" } });
+    const adminApiKey = "a-long-admin-api-key-for-tests-at-least-32-bytes";
+    const app = createApp({ User, config: { ...keys, adminApiKey, sessionSecret: "test-session-secret-with-at-least-32-bytes" } });
+    const submitted = await request(app).post("/api/contact").type("form").send({ nombre: "Ana", correo: "ana@example.com", descripcion: "Una consulta", consentimiento: "on" });
+    assert.equal(submitted.status, 201);
+    const contact = await ContactRequest.findOne({ correo: "ana@example.com" });
+    assert.equal(contact.nombre, "Ana");
+    assert.equal(contact.consentimiento, true);
+    const contacts = await request(app).get("/api/admin/contact-requests").set("X-Admin-Key", adminApiKey);
+    assert.equal(contacts.body.requests[0]._id, String(contact._id));
+    assert.equal((await request(app).delete(`/api/admin/contact-requests/${contact._id}`).set("X-Admin-Key", adminApiKey)).status, 200);
+    assert.equal(await ContactRequest.countDocuments(), 0);
     const loginWithDevice = async (pair) => {
       const challenge = (await request(app).post("/api/auth/device-challenge")).body.challenge;
       const devicePublicKey = pair.publicKey.export({ type: "spki", format: "pem" });

@@ -9,12 +9,13 @@ const { ISSUER, SESSION_AUDIENCE, OFFLINE_AUDIENCE, DEVICE_CHALLENGE_AUDIENCE } 
 const DeviceChallenge = require("./device-challenge");
 const SubscriptionPayment = require("./subscription-payment");
 const Product = require("./product");
+const ContactRequest = require("./contact-request");
 const { parseDevicePublicKey, verifyDeviceProof } = require("./device-crypto");
 const { listPendingRequests, approveDeviceRequest, rejectDeviceRequest } = require("./device-requests");
 
 const { normalizeUsername } = require("./username");
 
-function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPayment, Catalog = Product, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30 }) {
+function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPayment, Catalog = Product, Contact = ContactRequest, config, clock = () => Date.now(), loginLimit = 10, challengeLimit = 30, contactLimit = 5 }) {
   const app = express();
   app.set("trust proxy", "loopback");
   const dummyHash = bcrypt.hashSync(crypto.randomBytes(32).toString("hex"), 12);
@@ -69,8 +70,29 @@ function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPa
     res.set("Cache-Control", "no-store");
     next();
   });
+  app.use("/api/contact", (_req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+  });
   app.use(express.json({ limit: "8kb" }));
   app.get("/api/health", (_req, res) => res.json({ ok: true, message: "API Miniventa running" }));
+
+  app.post("/api/contact", rateLimit({ windowMs: 15 * 60 * 1000, limit: contactLimit, standardHeaders: "draft-8", legacyHeaders: false, message: "Demasiadas solicitudes. Intenta de nuevo más tarde." }), express.urlencoded({ extended: false, limit: "64kb", parameterLimit: 10 }), async (req, res, next) => {
+    const body = req.body || {};
+    const fields = ["nombre", "empresa", "correo", "telefono", "tipo", "descripcion"];
+    if (fields.some((field) => body[field] !== undefined && typeof body[field] !== "string")) return res.status(400).send("Datos inválidos. Revisa el formulario e intenta de nuevo.");
+    const data = Object.fromEntries(fields.map((field) => [field, (body[field] || "").trim()]));
+    const types = ["", "software-a-medida", "sistema-empresarial", "aplicacion-web", "aplicacion-movil", "automatizacion", "integracion", "demostracion-pos", "hia-recargas", "otro"];
+    if (!data.nombre || data.nombre.length > 100 || data.empresa.length > 150 || data.correo.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.correo) || data.telefono.length > 40 ||
+        !types.includes(data.tipo) || !data.descripcion || data.descripcion.length > 4000 || body.consentimiento !== "on") {
+      return res.status(400).send("Datos inválidos. Revisa el formulario e intenta de nuevo.");
+    }
+    try {
+      await Contact.create({ ...data, consentimiento: true });
+      return res.status(201).type("html").send('<!doctype html><html lang="es-MX"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Solicitud recibida</title><body><main><h1>Solicitud recibida</h1><p>Gracias por contactarnos. Hemos recibido tu solicitud.</p><a href="https://www.hiaventa.com/contacto/">Volver a contacto</a></main></body></html>');
+    } catch (error) { return next(error); }
+  });
 
   app.post("/api/auth/device-challenge", rateLimit({ windowMs: 15 * 60 * 1000, limit: challengeLimit, standardHeaders: "draft-8", legacyHeaders: false, message: { error: "too_many_attempts" } }), async (_req, res, next) => {
     try {
@@ -187,6 +209,20 @@ function createApp({ User, Challenge = DeviceChallenge, Payment = SubscriptionPa
     }
     return next();
   }
+
+  app.get("/api/admin/contact-requests", requireAdmin, async (_req, res, next) => {
+    try { return res.json({ requests: await Contact.find({}).sort({ createdAt: -1 }).limit(500) }); }
+    catch (error) { return next(error); }
+  });
+
+  app.delete("/api/admin/contact-requests/:id", requireAdmin, async (req, res, next) => {
+    if (!/^[a-f\d]{24}$/i.test(req.params.id)) return res.status(400).json({ error: "invalid_request" });
+    try {
+      const contact = await Contact.findByIdAndDelete(req.params.id);
+      if (!contact) return res.status(404).json({ error: "contact_request_not_found" });
+      return res.json({ deleted: true });
+    } catch (error) { return next(error); }
+  });
 
   app.get("/api/admin/products", requireAdmin, listProducts);
   app.post("/api/admin/products", requireAdmin, async (req, res, next) => {

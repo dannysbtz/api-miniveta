@@ -39,6 +39,8 @@ El panel `admin-miniventa` usa rutas protegidas por `X-Admin-Key`. Genera una cl
 
 - `GET /api/admin/users?search=<texto>`: lista hasta 500 cuentas y metadatos de sus dispositivos, sin hashes ni claves públicas.
 - `GET /api/admin/products`: lista el catálogo global completo.
+- `GET /api/admin/contact-requests`: lista hasta 500 solicitudes de contacto recientes, incluidos los datos personales y la fecha de recepción.
+- `DELETE /api/admin/contact-requests/:id`: elimina una solicitud de contacto por su identificador MongoDB.
 - `POST /api/admin/products`: registra `number`, `name` y `priceCents` (entero no negativo). El número es texto único de hasta 40 caracteres, por lo que `001` y `1` son distintos; el nombre admite hasta 150 caracteres. Un número duplicado responde `409 product_number_exists`.
 - `PUT /api/admin/products/:id`: reemplaza número, nombre y precio de un producto; usa el identificador de MongoDB devuelto por el API.
 - `DELETE /api/admin/products/:id`: elimina el producto de la nube, sin eliminar los datos guardados previamente en dispositivos.
@@ -59,6 +61,8 @@ La confirmación de pagos requiere un replica set o clúster MongoDB compatible 
 ## Contrato HTTP
 
 Usa HTTPS en producción. JSON UTF-8; respuestas de autenticación con `Cache-Control: no-store`. En los ejemplos, `<...>` representa un valor real.
+
+- `POST /api/contact`: recibe el formulario de HIA Solutions como `application/x-www-form-urlencoded`, con `nombre`, `empresa`, `correo`, `telefono`, `tipo`, `descripcion` y `consentimiento=on`. Nombre, correo, descripción y consentimiento son obligatorios; el cuerpo del formulario tiene un máximo de 64 KiB. Guarda la solicitud en MongoDB y responde con una página de confirmación únicamente después de guardarla. Responde `400` ante datos inválidos, `413` si el cuerpo excede el límite y `429` después de 5 intentos por IP en 15 minutos. El límite es en memoria por proceso; ajusta la protección y los proxies confiables al despliegue. No envía notificaciones por correo: consulta las solicitudes mediante la ruta administrativa. Los datos no caducan automáticamente; define y aplica una política de retención, acceso y privacidad antes de habilitar el formulario.
 
 - `GET /api/health`: `200 {"ok":true,"message":"API Miniventa running"}`.
 - `GET /api/products`: catálogo global completo, protegido por sesión activa y las mismas cabeceras de prueba de dispositivo que `/api/auth/access`. Devuelve `{"products":[{"id":"<id>","number":"001","name":"Pan","priceCents":2000}]}` y `Cache-Control: no-store`.
